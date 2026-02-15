@@ -1654,6 +1654,34 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
 
         return mm_inputs
 
+    @staticmethod
+    def _downscale_prior_images(images: list, scale: float) -> list:
+        r"""Resize all images except the last by ``scale`` (e.g. 0.5 = half).
+
+        Returns a new list; the last image is kept unchanged.
+        """
+        if len(images) <= 1 or scale >= 1.0:
+            return images
+
+        from PIL import Image as _PILImage
+
+        result = []
+        for img_input in images[:-1]:
+            if isinstance(img_input, str):
+                img = _PILImage.open(img_input)
+            elif not isinstance(img_input, _PILImage.Image):
+                img = img_input  # leave non-PIL/non-path inputs as-is
+            else:
+                img = img_input
+            if isinstance(img, _PILImage.Image):
+                new_w = max(1, int(img.width * scale))
+                new_h = max(1, int(img.height * scale))
+                img = img.resize((new_w, new_h), _PILImage.LANCZOS)
+            result.append(img)
+
+        result.append(images[-1])
+        return result
+
     @override
     def process_messages(
         self,
@@ -1669,6 +1697,11 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
         messages = deepcopy(messages)
         image_processor: BaseImageProcessor = getattr(processor, "image_processor")
         video_processor: BaseImageProcessor = getattr(processor, "video_processor")
+
+        # Downscale prior images so token counts reflect the reduced resolution
+        prior_image_scale: float = getattr(processor, "prior_image_scale", 1.0)
+        if prior_image_scale < 1.0 and len(images) > 1:
+            images = self._downscale_prior_images(images, prior_image_scale)
 
         image_merge_length: int = getattr(image_processor, "merge_size") ** 2
         video_merge_length: int = getattr(video_processor, "merge_size") ** 2

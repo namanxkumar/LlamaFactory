@@ -105,13 +105,40 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         else:
             self.get_rope_func = None
 
+    @staticmethod
+    def _downscale_prior_images(images: list, scale: float) -> list:
+        r"""Resize all images except the last one by `scale` (e.g. 0.5 for half size).
+
+        Prior images (all but last) are loaded, resized, and returned as PIL
+        Image objects. The last image (current observation) is left untouched.
+        """
+        if len(images) <= 1 or scale >= 1.0:
+            return images
+
+        result = []
+        for i, img_input in enumerate(images[:-1]):
+            if isinstance(img_input, str):
+                img = Image.open(img_input)
+            else:
+                img = img_input
+
+            new_w = max(1, int(img.width * scale))
+            new_h = max(1, int(img.height * scale))
+            result.append(img.resize((new_w, new_h), Image.LANCZOS))
+
+        result.append(images[-1])  # keep last image as-is (path or PIL)
+        return result
+
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+        prior_image_scale: float = getattr(self.processor, "prior_image_scale", 1.0) if self.processor else 1.0
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
+            if prior_image_scale < 1.0 and len(images) > 1:
+                images = self._downscale_prior_images(images, prior_image_scale)
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)

@@ -341,6 +341,17 @@ class ProcessorArguments:
         default=16000,
         metadata={"help": "The sampling rate of audio inputs."},
     )
+    prior_image_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Scale factor applied to all images except the last one in each "
+                "sample (the 'prior' observation images). Set to 0.5 to halve "
+                "both dimensions, reducing vision tokens by ~4x per prior image. "
+                "The last image (current observation) is always kept at full scale."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.image_max_pixels < self.image_min_pixels:
