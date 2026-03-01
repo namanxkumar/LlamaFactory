@@ -28,6 +28,187 @@ from typing_extensions import override
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
+
+
+# ---------------------------------------------------------------------------
+# Answer-token loss weighting
+# ---------------------------------------------------------------------------
+# Tokens inside <answer>(x,y)</answer> spans are upweighted by this factor.
+# Answer actions are rare relative to navigation actions, so boosting their
+# gradient prevents the model from ignoring them during SFT.
+# Set via ANSWER_TOKEN_WEIGHT env var (default 1.0 = disabled).
+_ANSWER_TOKEN_WEIGHT = float(os.environ.get("ANSWER_TOKEN_WEIGHT", "1.0"))
+_answer_open_ids: "list[int] | None" = None
+_answer_close_ids: "list[int] | None" = None
+_answer_debug_logged: bool = False
+
+
+def _get_answer_tag_ids(tokenizer) -> "tuple[list[int], list[int]]":
+    global _answer_open_ids, _answer_close_ids
+    if _answer_open_ids is None:
+        # Unwrap Processor → Tokenizer (Qwen3-VL uses a Processor as processing_class)
+        tok = getattr(tokenizer, "tokenizer", tokenizer)
+        _answer_open_ids = tok.encode("<answer>", add_special_tokens=False)
+        _answer_close_ids = tok.encode("</answer>", add_special_tokens=False)
+    return _answer_open_ids, _answer_close_ids
+
+
+def _build_answer_weights(labels: "torch.Tensor", tokenizer) -> "torch.Tensor":
+    """Build a (batch, seq_len) float weight tensor for answer-token upweighting.
+
+    - 0.0  for IGNORE_INDEX positions (prompt / padding, excluded from loss)
+    - _ANSWER_TOKEN_WEIGHT for tokens inside/including <answer>…</answer> spans
+    - 1.0  for all other response tokens
+
+    Uses decoded text matching instead of token-ID matching to avoid BPE
+    boundary issues (e.g. ``\\n<`` merging into one token).
+    """
+    tok = getattr(tokenizer, "tokenizer", tokenizer)
+    weights = torch.ones_like(labels, dtype=torch.float32)
+    weights[labels == IGNORE_INDEX] = 0.0
+
+    OPEN_TAG = "<answer>"
+    CLOSE_TAG = "</answer>"
+
+    for b in range(labels.size(0)):
+        row = labels[b].tolist()
+        # Decode each token individually to map token positions to text
+        token_texts: list[str] = []
+        for tid in row:
+            if tid == IGNORE_INDEX:
+                token_texts.append("")
+            else:
+                token_texts.append(tok.decode([tid]))
+
+        # Build cumulative char offsets: char_offsets[t] = start char of token t
+        char_offsets: list[int] = []
+        cum = 0
+        for txt in token_texts:
+            char_offsets.append(cum)
+            cum += len(txt)
+
+        full_text = "".join(token_texts)
+
+        # Find all <answer>...</answer> spans in the decoded text
+        search_start = 0
+        while True:
+            open_pos = full_text.find(OPEN_TAG, search_start)
+            if open_pos == -1:
+                break
+            close_pos = full_text.find(CLOSE_TAG, open_pos + len(OPEN_TAG))
+            if close_pos == -1:
+                break
+            span_end = close_pos + len(CLOSE_TAG)
+
+            # Upweight all tokens that overlap with [open_pos, span_end)
+            for t in range(len(row)):
+                tok_start = char_offsets[t]
+                tok_end = tok_start + len(token_texts[t])
+                if tok_end <= open_pos:
+                    continue
+                if tok_start >= span_end:
+                    break
+                # Token overlaps with the answer span
+                if row[t] != IGNORE_INDEX:
+                    weights[b, t] = _ANSWER_TOKEN_WEIGHT
+
+            search_start = span_end
+
+    return weights
+
+
+def answer_weighted_loss_func(
+    outputs: "torch.Tensor",
+    labels: "torch.Tensor",
+    tokenizer,
+) -> "tuple[torch.Tensor, float, float, int]":
+    """Cross-entropy loss with per-token upweighting for <answer>…</answer> spans.
+
+    Returns (weighted_loss, answer_loss_scalar, nav_loss_scalar, answer_token_count).
+    The sub-losses are detached floats for logging only; only weighted_loss
+    receives gradients.
+
+    Normalization: returns a weighted token-level mean (same scale as
+    CrossEntropyLoss(reduction="mean")).  The caller (training_step) then
+    divides by gradient_accumulation_steps because model_accepts_loss_kwargs=False
+    and compute_loss_func=None — do NOT divide by num_items_in_batch here.
+    """
+    global _answer_debug_logged
+
+    logits = outputs.get("logits")
+    if logits is None:
+        fallback = outputs.get("loss", torch.tensor(0.0))
+        return fallback, 0.0, 0.0, 0
+
+    logits = logits.float()
+
+    # Causal-LM shift: token t predicts token t+1
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    weights = _build_answer_weights(shift_labels, tokenizer).to(shift_logits.device)
+
+    # One-time diagnostic: dump answer span tokens, their labels, and per-token loss
+    if not _answer_debug_logged:
+        _answer_debug_logged = True
+        n_answer_toks = int((weights == _ANSWER_TOKEN_WEIGHT).sum().item())
+        tok = getattr(tokenizer, "tokenizer", tokenizer)
+        diag_parts = [
+            f"[AnswerWeight] weight={_ANSWER_TOKEN_WEIGHT} | "
+            f"method=decoded-text-match | "
+            f"answer-span tokens in first batch={n_answer_toks}"
+        ]
+        # Show per-token detail for first batch element with answer tokens
+        if n_answer_toks > 0:
+            # Compute per-token loss for the diagnostic (before weighting)
+            _diag_loss = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            ).view(shift_labels.size())
+            for b in range(shift_labels.size(0)):
+                mask_b = weights[b] == _ANSWER_TOKEN_WEIGHT
+                if not mask_b.any():
+                    continue
+                idxs = mask_b.nonzero(as_tuple=True)[0].tolist()
+                tids = shift_labels[b, idxs].tolist()
+                losses = _diag_loss[b, idxs].tolist()
+                decoded = [tok.decode([int(t)]) for t in tids]
+                # Logit stats at answer positions
+                answer_logits = shift_logits[b, idxs]  # (n_answer, vocab)
+                correct_logits = [shift_logits[b, idx, int(tid)].item() for idx, tid in zip(idxs, tids)]
+                max_logits = answer_logits.max(dim=-1).values.tolist()
+                diag_parts.append(
+                    f"[AnswerWeight] batch={b} positions={idxs} "
+                    f"token_ids={tids} decoded={decoded} "
+                    f"per_token_loss={[f'{l:.2e}' for l in losses]} "
+                    f"correct_logit={[f'{v:.2f}' for v in correct_logits]} "
+                    f"max_logit={[f'{v:.2f}' for v in max_logits]}"
+                )
+                break  # only first matching batch element
+        for part in diag_parts:
+            logger.info_rank0(part)
+
+    loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+    token_loss = loss_fct(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+    ).view(shift_labels.size())  # (batch, seq_len-1)
+
+    # Weighted mean: divide by number of active tokens (not sum of weights)
+    # so the loss scale matches standard CE and the weights only control
+    # relative token importance, not overall loss magnitude.
+    active_count = (weights > 0).float().sum().clamp(min=1)
+    weighted_loss = (token_loss * weights).sum() / active_count
+
+    # Unweighted per-action-type means for logging (detached, no grad)
+    with torch.no_grad():
+        answer_mask = weights == _ANSWER_TOKEN_WEIGHT  # True for answer-span tokens
+        nav_mask = (weights == 1.0)                    # True for ordinary response tokens
+        answer_loss = token_loss[answer_mask].mean().item() if answer_mask.any() else 0.0
+        nav_loss = token_loss[nav_mask].mean().item() if nav_mask.any() else 0.0
+        answer_count = int(answer_mask.sum().item())
+
+    return weighted_loss, answer_loss, nav_loss, answer_count
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
@@ -158,6 +339,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 ref_logits = ref_outputs.logits
             outputs = model(**inputs)
             return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
+        elif _ANSWER_TOKEN_WEIGHT != 1.0 and "labels" in inputs:
+            return_outputs = kwargs.get("return_outputs", False)
+            labels = inputs["labels"]
+            outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
+            loss, answer_loss, nav_loss, answer_count = answer_weighted_loss_func(outputs, labels, self.processing_class)
+            # Log per-action-type losses to W&B / TensorBoard every step
+            if self.model.training:
+                self.log({
+                    "loss/answer_tokens": answer_loss,
+                    "loss/nav_tokens": nav_loss,
+                    "train/answer_token_count": answer_count,
+                })
+            return (loss, outputs) if return_outputs else loss
         else:
             return super().compute_loss(model, inputs, *args, **kwargs)
 
