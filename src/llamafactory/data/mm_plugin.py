@@ -19,6 +19,8 @@ import inspect
 import math
 import os
 import re
+import tarfile
+import threading
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
@@ -41,6 +43,66 @@ from ..extras.packages import is_pillow_available, is_pyav_available, is_transfo
 if is_pillow_available():
     from PIL import Image
     from PIL.Image import Image as ImageObject
+
+
+# ── Tar-shard image loading (spatial-reasoning fork) ───────────────────
+# Resolves images missing on disk by reading them out of sibling tar files
+# (``<dir>/*.tar``). Enabled by default; opt out with LF_DISABLE_TAR_IMAGES=1.
+# Keeps a per-process TarFile cache keyed on (pid, tar_path) because TarFile
+# handles are not fork-safe.
+
+_TAR_CACHE: dict = {}
+_TAR_CACHE_LOCK = threading.Lock()
+_TAR_INDEX: dict = {}  # dir_path -> {basename: tar_path}
+_TAR_MISSING: set = set()  # dirs known to have no tars
+
+
+def _tar_index_for_dir(dir_path: str) -> Optional[dict]:
+    if dir_path in _TAR_MISSING:
+        return None
+    idx = _TAR_INDEX.get(dir_path)
+    if idx is not None:
+        return idx
+    if not os.path.isdir(dir_path):
+        _TAR_MISSING.add(dir_path)
+        return None
+    tar_paths = sorted(
+        os.path.join(dir_path, f) for f in os.listdir(dir_path) if f.endswith(".tar")
+    )
+    if not tar_paths:
+        _TAR_MISSING.add(dir_path)
+        return None
+    idx = {}
+    for tar_path in tar_paths:
+        with tarfile.open(tar_path, "r") as tar:
+            for name in tar.getnames():
+                idx[name] = tar_path
+    _TAR_INDEX[dir_path] = idx
+    return idx
+
+
+def _resolve_tar_image(path: str) -> Optional[bytes]:
+    """If ``path`` is absent but a sibling tar contains it, return its bytes."""
+    if os.environ.get("LF_DISABLE_TAR_IMAGES") == "1":
+        return None
+    dir_path = os.path.dirname(path)
+    basename = os.path.basename(path)
+    idx = _tar_index_for_dir(dir_path)
+    if idx is None:
+        return None
+    tar_path = idx.get(basename)
+    if tar_path is None:
+        return None
+    key = (os.getpid(), tar_path)
+    with _TAR_CACHE_LOCK:
+        tar = _TAR_CACHE.get(key)
+        if tar is None:
+            tar = tarfile.open(tar_path, "r")
+            _TAR_CACHE[key] = tar
+        f = tar.extractfile(basename)
+        if f is None:
+            return None
+        return f.read()
 
 
 if is_pyav_available():
@@ -253,7 +315,15 @@ class MMPluginMixin:
         r"""Regularize images to avoid error. Including reading and pre-processing."""
         results = []
         for image in images:
-            if isinstance(image, (str, BinaryIO)):
+            if isinstance(image, str):
+                if not os.path.exists(image):
+                    data = _resolve_tar_image(image)
+                    if data is None:
+                        raise FileNotFoundError(image)
+                    image = Image.open(BytesIO(data))
+                else:
+                    image = Image.open(image)
+            elif isinstance(image, BinaryIO):
                 image = Image.open(image)
             elif isinstance(image, bytes):
                 image = Image.open(BytesIO(image))
@@ -261,7 +331,14 @@ class MMPluginMixin:
                 if image["bytes"] is not None:
                     image = Image.open(BytesIO(image["bytes"]))
                 else:
-                    image = Image.open(image["path"])
+                    path = image["path"]
+                    if not os.path.exists(path):
+                        data = _resolve_tar_image(path)
+                        if data is None:
+                            raise FileNotFoundError(path)
+                        image = Image.open(BytesIO(data))
+                    else:
+                        image = Image.open(path)
 
             if not isinstance(image, ImageObject):
                 raise ValueError(f"Expect input is a list of images, but got {type(image)}.")
