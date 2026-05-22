@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
+from ..data_utils import Role
 from .processor_utils import DatasetProcessor, greedy_knapsack, infer_seqlen
 
 
@@ -46,8 +47,16 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         )
         encoded_pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools)
         total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
+        # Per-turn loss weights: a message with ``loss_weight == 0`` has its
+        # assistant tokens masked out (-100) so it contributes to context but
+        # not to the supervised loss. Used by DAgger-style training where
+        # student-prefix assistant turns provide deployment-distribution
+        # context but should not be imitated.
+        assistant_msgs = [m for m in (prompt + response) if m.get("role") == Role.ASSISTANT.value]
+        turn_loss_weights = [float(m.get("loss_weight", 1.0)) for m in assistant_msgs]
         if self.data_args.mask_history:
             encoded_pairs = encoded_pairs[::-1]  # high priority for last turns
+            turn_loss_weights = turn_loss_weights[::-1]
 
         for turn_idx, (source_ids, target_ids) in enumerate(encoded_pairs):
             if total_length >= self.data_args.cutoff_len:
@@ -68,6 +77,8 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 source_label = [IGNORE_INDEX] * source_len
 
             if self.data_args.mask_history and turn_idx != 0:  # train on the last turn only
+                target_label = [IGNORE_INDEX] * target_len
+            elif turn_idx < len(turn_loss_weights) and turn_loss_weights[turn_idx] == 0.0:
                 target_label = [IGNORE_INDEX] * target_len
             else:
                 target_label = target_ids

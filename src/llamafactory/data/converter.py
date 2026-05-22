@@ -157,12 +157,13 @@ class SharegptDatasetConverter(DatasetConverter):
                 broken_data = True
                 break
 
-            aligned_messages.append(
-                {
-                    "role": tag_mapping[message[self.dataset_attr.role_tag]],
-                    "content": message[self.dataset_attr.content_tag],
-                }
-            )
+            aligned_msg = {
+                "role": tag_mapping[message[self.dataset_attr.role_tag]],
+                "content": message[self.dataset_attr.content_tag],
+            }
+            if "loss_weight" in message:
+                aligned_msg["loss_weight"] = float(message["loss_weight"])
+            aligned_messages.append(aligned_msg)
 
         if (not self.dataset_attr.ranking and len(aligned_messages) % 2 != 0) or (
             self.dataset_attr.ranking and len(aligned_messages) % 2 == 0
